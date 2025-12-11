@@ -85,19 +85,32 @@ if not token:
         st.dataframe(pd.read_sql(f"SELECT * FROM {tab}", conn), use_container_width=True)
         conn.close()
 
-    elif menu == "설정":
+elif menu == "설정":
         st.title("⚙️ 시스템 설정")
-        st.write("테스트를 위한 초기 데이터를 자동으로 생성합니다.")
         
-        if st.button("샘플 데이터 생성하기", type="primary"):
-            msg = db.create_sample_data()
-            st.success(msg)
-            if "완료" in msg:
-                st.balloons()
+        st.warning("⚠️ 데이터 상태가 꼬였을 때만 사용하세요.")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("1. DB 강제 초기화 (Reset)", type="primary"):
+                msg = db.reset_database()
+                st.toast(msg, icon="🧹")
+                st.success(msg)
                 
-        st.markdown("---")
+        with col2:
+            if st.button("2. 샘플 데이터 생성하기"):
+                msg = db.create_sample_data()
+                if "완료" in msg:
+                    st.success(msg)
+                    st.balloons()
+                else:
+                    st.warning(msg)
+                
+        st.divider()
         st.write("👉 **테스트 링크:**")
-        st.code("https://leadership-360-jgj2r83.streamlit.app/?token=test1234", language="text")
+        # 실제 Streamlit 배포 주소가 있다면 그걸로 테스트하세요. 로컬용은 아래와 같습니다.
+        st.code("https://leadership-360-test.streamlit.app/?token=test1234", language="text")
 
 # ==========================================
 #  Scenario B: 응답자 모드 (토큰 있음)
@@ -156,3 +169,4 @@ else:
                         st.rerun()
             elif total > done:
                 st.info("👈 왼쪽에서 평가할 대상을 선택해주세요.")
+
