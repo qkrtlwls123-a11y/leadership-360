@@ -1,70 +1,68 @@
 import sqlite3
 import pandas as pd
 import uuid
+import datetime
 
 DB_FILE = "leadership_360.db"
 
 def get_connection():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row # 컬럼명으로 접근 가능하게 설정
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    """DB 테이블 생성 (최초 1회 실행)"""
     conn = get_connection()
     c = conn.cursor()
     
-    # 1. 기업 (Tenant)
+    # 1. 기업 (고객사)
     c.execute('''CREATE TABLE IF NOT EXISTS corporates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
-    # 2. 프로젝트
+    # 2. 프로젝트 (연도/차수)
     c.execute('''CREATE TABLE IF NOT EXISTS projects (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         corporate_id INTEGER,
         name TEXT NOT NULL,
         year INTEGER,
-        status TEXT DEFAULT 'SETUP',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (corporate_id) REFERENCES corporates(id)
     )''')
     
-    # 3. 리더 (피평가자) - 사번(code) 추가
+    # 3. 리더 (피평가자)
     c.execute('''CREATE TABLE IF NOT EXISTS leaders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER,
         name TEXT NOT NULL,
-        leader_code TEXT, -- 사번 등 고유값
+        leader_code TEXT,
         position TEXT,
         department TEXT,
-        email TEXT,
         FOREIGN KEY (project_id) REFERENCES projects(id)
     )''')
     
-    # 4. 평가자 - 사번(code) 추가
+    # 4. 평가자 (링크 토큰 보유)
     c.execute('''CREATE TABLE IF NOT EXISTS evaluators (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER,
         name TEXT NOT NULL,
-        evaluator_code TEXT, -- 사번
+        evaluator_code TEXT,
         email TEXT NOT NULL,
         access_token TEXT UNIQUE,
-        is_active BOOLEAN DEFAULT 1,
         FOREIGN KEY (project_id) REFERENCES projects(id)
     )''')
     
-    # 5. 할당 (Assignment) - 그룹(project_group) 추가
+    # 5. 할당 (Assignment)
     c.execute('''CREATE TABLE IF NOT EXISTS assignments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER,
         evaluator_id INTEGER,
         leader_id INTEGER,
-        relation TEXT, -- 상사(boss), 동료(co), 부하(sub), 본인(self)
-        project_group TEXT, -- 부서명이나 그룹명
+        relation TEXT,
+        project_group TEXT,
         status TEXT DEFAULT 'PENDING',
-        completed_at TIMESTAMP,
         FOREIGN KEY (evaluator_id) REFERENCES evaluators(id),
         FOREIGN KEY (leader_id) REFERENCES leaders(id)
     )''')
@@ -83,118 +81,110 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- 엑셀 업로드를 위한 데이터 처리 함수 ---
+# --- 관리자용: 데이터 업로드 처리 함수 ---
 
 def get_or_create_project(corp_name, project_name, year):
-    """기업과 프로젝트가 없으면 만들고 ID 반환"""
+    """기업명, 프로젝트명, 연도를 받아 ID를 반환 (없으면 생성)"""
     conn = get_connection()
     c = conn.cursor()
     
-    # 1. 기업 조회/생성
-    c.execute("SELECT id FROM corporates WHERE name = ?", (corp_name,))
-    row = c.fetchone()
-    if row:
-        corp_id = row['id']
-    else:
-        c.execute("INSERT INTO corporates (name) VALUES (?)", (corp_name,))
-        corp_id = c.lastrowid
-        
-    # 2. 프로젝트 조회/생성
-    c.execute("SELECT id FROM projects WHERE corporate_id = ? AND name = ?", (corp_id, project_name))
-    row = c.fetchone()
-    if row:
-        proj_id = row['id']
-    else:
-        c.execute("INSERT INTO projects (corporate_id, name, year) VALUES (?, ?, ?)", (corp_id, project_name, year))
-        proj_id = c.lastrowid
-        
-    conn.commit()
-    conn.close()
-    return proj_id
+    try:
+        # 1. 기업 확인/생성
+        c.execute("SELECT id FROM corporates WHERE name = ?", (corp_name,))
+        row = c.fetchone()
+        if row:
+            corp_id = row['id']
+        else:
+            c.execute("INSERT INTO corporates (name) VALUES (?)", (corp_name,))
+            corp_id = c.lastrowid
+            
+        # 2. 프로젝트 확인/생성
+        c.execute("SELECT id FROM projects WHERE corporate_id = ? AND name = ? AND year = ?", (corp_id, project_name, year))
+        row = c.fetchone()
+        if row:
+            proj_id = row['id']
+        else:
+            c.execute("INSERT INTO projects (corporate_id, name, year) VALUES (?, ?, ?)", (corp_id, project_name, year))
+            proj_id = c.lastrowid
+            
+        conn.commit()
+        return proj_id
+    finally:
+        conn.close()
 
 def process_bulk_upload(project_id, df):
-    """
-    업로드된 엑셀/CSV 데이터를 DB에 일괄 등록 (기존 route.ts 로직 이식)
-    df 컬럼: evaluator_email, evaluator_name, evaluator_code, leader_name, leader_code, relation, project_group
-    """
+    """엑셀 데이터를 DB에 일괄 등록"""
     conn = get_connection()
     c = conn.cursor()
     
-    created_count = 0
-    skipped_count = 0
+    cnt_created = 0
+    cnt_skipped = 0
     
-    # 관계 매핑 (한글 -> 영문 코드)
-    RELATION_MAP = {
-        '상사': 'boss', 'boss': 'boss',
-        '동료': 'co', 'co': 'co',
-        '부하': 'sub', '부하직원': 'sub', 'sub': 'sub',
-        '본인': 'self', 'self': 'self'
-    }
+    # 관계명 매핑 (한글 -> 코드)
+    RELATION_MAP = {'상사': 'BOSS', '동료': 'PEER', '부하': 'SUB', '본인': 'SELF'}
 
     try:
         for _, row in df.iterrows():
-            # 1. 필수값 체크
-            if pd.isna(row['evaluator_email']) or pd.isna(row['leader_name']):
+            # 필수값 체크
+            if pd.isna(row.get('evaluator_email')) or pd.isna(row.get('leader_name')):
                 continue
 
-            # 2. 관계 변환
-            raw_rel = str(row['relation']).strip()
-            relation = RELATION_MAP.get(raw_rel, 'co') # 기본값 동료
-
-            # 3. 평가자(Evaluator) 찾기 또는 생성
+            # 1. 평가자(Evaluator) 등록
+            # 프로젝트 내에서 이메일로 중복 체크
             c.execute("SELECT id FROM evaluators WHERE project_id=? AND email=?", (project_id, row['evaluator_email']))
             ev_row = c.fetchone()
+            
             if ev_row:
                 ev_id = ev_row['id']
             else:
-                token = uuid.uuid4().hex[:16] # 난수 토큰 생성
+                # 난수 토큰 생성 (접속 링크용)
+                token = uuid.uuid4().hex[:16]
                 c.execute("""
                     INSERT INTO evaluators (project_id, name, evaluator_code, email, access_token)
                     VALUES (?, ?, ?, ?, ?)
-                """, (project_id, row['evaluator_name'], row.get('evaluator_code'), row['evaluator_email'], token))
+                """, (project_id, row['evaluator_name'], str(row.get('evaluator_code','')), row['evaluator_email'], token))
                 ev_id = c.lastrowid
 
-            # 4. 리더(Leader) 찾기 또는 생성
-            # 리더 구분은 사번(leader_code)이 있으면 사번으로, 없으면 이름+이메일로
-            leader_code = row.get('leader_code', '')
-            c.execute("SELECT id FROM leaders WHERE project_id=? AND leader_code=?", (project_id, leader_code))
+            # 2. 리더(Leader) 등록
+            # 이름+코드 조합으로 중복 체크
+            leader_code = str(row.get('leader_code', ''))
+            c.execute("SELECT id FROM leaders WHERE project_id=? AND name=? AND leader_code=?", (project_id, row['leader_name'], leader_code))
             ld_row = c.fetchone()
             
             if ld_row:
                 ld_id = ld_row['id']
             else:
                 c.execute("""
-                    INSERT INTO leaders (project_id, name, leader_code, department)
-                    VALUES (?, ?, ?, ?)
-                """, (project_id, row['leader_name'], leader_code, row.get('project_group')))
+                    INSERT INTO leaders (project_id, name, leader_code, department, position)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (project_id, row['leader_name'], leader_code, row.get('project_group'), row.get('leader_position', '')))
                 ld_id = c.lastrowid
 
-            # 5. 할당(Assignment) 생성 (중복 체크)
+            # 3. 할당(Assignment) 등록
             c.execute("SELECT id FROM assignments WHERE evaluator_id=? AND leader_id=?", (ev_id, ld_id))
             if not c.fetchone():
+                rel_code = RELATION_MAP.get(row.get('relation'), row.get('relation'))
                 c.execute("""
                     INSERT INTO assignments (project_id, evaluator_id, leader_id, relation, project_group)
                     VALUES (?, ?, ?, ?, ?)
-                """, (project_id, ev_id, ld_id, relation, row.get('project_group')))
-                created_count += 1
+                """, (project_id, ev_id, ld_id, rel_code, row.get('project_group')))
+                cnt_created += 1
             else:
-                skipped_count += 1
+                cnt_skipped += 1
         
         conn.commit()
-        return True, f"✅ 처리 완료: 신규 {created_count}건, 중복 제외 {skipped_count}건"
-        
+        return True, f"처리 완료: 신규 {cnt_created}건, 중복 {cnt_skipped}건"
     except Exception as e:
-        return False, f"⛔ 오류 발생: {str(e)}"
+        return False, f"오류 발생: {str(e)}"
     finally:
         conn.close()
 
-# ... (기존 조회 함수들은 그대로 사용하거나 새 컬럼에 맞춰 수정) ...
-# 아래 두 함수는 기존 코드를 유지하되 새 컬럼을 반영했습니다.
+# --- 응답자용: 조회 및 저장 함수 ---
 
 def get_evaluator_by_token(token):
     conn = get_connection()
     query = """
-        SELECT E.id, E.name, E.email, P.name as project_name, C.name as corp_name, E.project_id
+        SELECT E.id, E.name, P.name as project_name, C.name as corp_name, E.project_id
         FROM evaluators E
         JOIN projects P ON E.project_id = P.id
         JOIN corporates C ON P.corporate_id = C.id
