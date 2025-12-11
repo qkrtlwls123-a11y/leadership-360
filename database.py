@@ -70,19 +70,129 @@ def init_db():
         FOREIGN KEY (leader_id) REFERENCES leaders(id)
     )''')
     
-    # 6. 응답
+    # 6. 프로젝트별 진단 문항
+    c.execute('''CREATE TABLE IF NOT EXISTS survey_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        title TEXT NOT NULL,
+        question_type TEXT NOT NULL DEFAULT 'SCALE',
+        scale_min INTEGER DEFAULT 1,
+        scale_max INTEGER DEFAULT 5,
+        sort_order INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    )''')
+
+    # 7. 응답 (문항 단위)
     c.execute('''CREATE TABLE IF NOT EXISTS responses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         assignment_id INTEGER,
-        q1_score INTEGER,
-        q2_score INTEGER,
-        comment TEXT,
+        question_id INTEGER,
+        response_value TEXT,
         submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (assignment_id) REFERENCES assignments(id)
+        FOREIGN KEY (assignment_id) REFERENCES assignments(id),
+        FOREIGN KEY (question_id) REFERENCES survey_questions(id)
     )''')
     
     conn.commit()
+
+    # 스키마 업그레이드: 기존 responses 테이블이 옛 구조(q1/q2)인 경우 재생성
+    try:
+        cols = pd.read_sql("PRAGMA table_info(responses)", conn)["name"].tolist()
+        if set(["q1_score", "q2_score", "comment"]).issubset(set(cols)):
+            c.execute("DROP TABLE IF EXISTS responses")
+            c.execute('''CREATE TABLE IF NOT EXISTS responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assignment_id INTEGER,
+                question_id INTEGER,
+                response_value TEXT,
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (assignment_id) REFERENCES assignments(id),
+                FOREIGN KEY (question_id) REFERENCES survey_questions(id)
+            )''')
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# === 조회 편의 함수 ===
+
+
+def list_corporates():
+    """모든 기업 목록을 반환"""
+    conn = get_connection()
+    df = pd.read_sql(
+        "SELECT id, name, created_at FROM corporates ORDER BY name",
+        conn,
+    )
     conn.close()
+    return df
+
+
+def list_projects(corporate_id=None):
+    """프로젝트 목록 (기업으로 필터 가능)"""
+    conn = get_connection()
+    query = """
+        SELECT P.id, P.name, P.year, P.status, C.name AS corporate_name
+        FROM projects P
+        JOIN corporates C ON P.corporate_id = C.id
+        WHERE (? IS NULL OR C.id = ?)
+        ORDER BY P.year DESC, P.id DESC
+    """
+    df = pd.read_sql(query, conn, params=(corporate_id, corporate_id))
+    conn.close()
+    return df
+
+
+def list_questions(project_id):
+    """프로젝트별 등록된 문항을 정렬 순서로 반환"""
+    conn = get_connection()
+    df = pd.read_sql(
+        """
+        SELECT id, title, question_type, scale_min, scale_max, sort_order
+        FROM survey_questions
+        WHERE project_id = ?
+        ORDER BY sort_order ASC, id ASC
+        """,
+        conn,
+        params=(project_id,),
+    )
+    conn.close()
+    return df
+
+
+def get_dashboard_overview(corporate_id=None):
+    """기업/프로젝트 단위 진행 현황 요약"""
+    conn = get_connection()
+    query = """
+        SELECT
+            C.id AS corporate_id,
+            C.name AS corporate_name,
+            P.id AS project_id,
+            P.name AS project_name,
+            P.year,
+            COUNT(DISTINCT A.id) AS total_assignments,
+            SUM(CASE WHEN A.status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_assignments,
+            COUNT(DISTINCT E.id) AS evaluator_count,
+            COUNT(DISTINCT L.id) AS leader_count
+        FROM projects P
+        JOIN corporates C ON P.corporate_id = C.id
+        LEFT JOIN assignments A ON P.id = A.project_id
+        LEFT JOIN evaluators E ON P.id = E.project_id
+        LEFT JOIN leaders L ON P.id = L.project_id
+        WHERE (? IS NULL OR C.id = ?)
+        GROUP BY P.id
+        ORDER BY P.year DESC, P.id DESC
+    """
+    df = pd.read_sql(query, conn, params=(corporate_id, corporate_id))
+    conn.close()
+    if not df.empty:
+        df["completion_rate"] = (
+            (df["completed_assignments"] / df["total_assignments"].replace({0: None}))
+            .fillna(0)
+            .round(3)
+        )
+    return df
 
 # --- 데이터 업로드 및 생성 함수 ---
 
@@ -145,7 +255,7 @@ def process_bulk_upload(project_id, df):
             c.execute("SELECT id FROM assignments WHERE evaluator_id=? AND leader_id=?", (ev_id, ld_id))
             if not c.fetchone():
                 rel_code = RELATION_MAP.get(row.get('relation'), row.get('relation'))
-                c.execute("INSERT INTO assignments (project_id, evaluator_id, leader_id, relation, project_group) VALUES (?, ?, ?, ?, ?)", 
+                c.execute("INSERT INTO assignments (project_id, evaluator_id, leader_id, relation, project_group) VALUES (?, ?, ?, ?, ?)",
                           (project_id, ev_id, ld_id, rel_code, row.get('project_group')))
                 cnt_created += 1
             else:
@@ -187,6 +297,16 @@ def create_sample_data():
     # 4. 할당
     c.execute("INSERT INTO assignments (project_id, evaluator_id, leader_id, relation) VALUES (?, ?, ?, 'BOSS')", (proj_id, ev_id, ld1))
     c.execute("INSERT INTO assignments (project_id, evaluator_id, leader_id, relation) VALUES (?, ?, ?, 'PEER')", (proj_id, ev_id, ld2))
+
+    # 5. 샘플 문항
+    c.execute(
+        "INSERT INTO survey_questions (project_id, title, question_type, scale_min, scale_max, sort_order) VALUES (?, '전반적인 리더십 역량', 'SCALE', 1, 5, 1)",
+        (proj_id,),
+    )
+    c.execute(
+        "INSERT INTO survey_questions (project_id, title, question_type, scale_min, scale_max, sort_order) VALUES (?, '가장 강점이라고 생각하는 점', 'TEXT', 1, 5, 2)",
+        (proj_id,),
+    )
     
     conn.commit()
     conn.close()
@@ -219,17 +339,103 @@ def get_my_assignments(evaluator_id):
     conn.close()
     return df
 
-def save_response(assignment_id, q1, q2, comment):
+def save_assignment_responses(assignment_id, answers):
+    """단일 할당에 대한 문항별 응답 저장"""
     conn = get_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO responses (assignment_id, q1_score, q2_score, comment) VALUES (?, ?, ?, ?)", 
-              (assignment_id, q1, q2, comment))
-    c.execute("UPDATE assignments SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE id = ?", (assignment_id,))
-    conn.commit()
-    conn.close()
-    return True
+    try:
+        c.execute("DELETE FROM responses WHERE assignment_id = ?", (assignment_id,))
+        for question_id, value in answers.items():
+            c.execute(
+                "INSERT INTO responses (assignment_id, question_id, response_value) VALUES (?, ?, ?)",
+                (assignment_id, int(question_id), str(value)),
+            )
+        c.execute(
+            "UPDATE assignments SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (assignment_id,),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
-# database.py 맨 아래에 추가하세요
+
+def get_project_snapshot(project_id):
+    """프로젝트별 주요 지표 (할당/완료/응답 수)"""
+    conn = get_connection()
+    data = {}
+    try:
+        df = pd.read_sql(
+            "SELECT status, COUNT(*) as cnt FROM assignments WHERE project_id = ? GROUP BY status",
+            conn,
+            params=(project_id,),
+        )
+        total_assignments = df["cnt"].sum() if not df.empty else 0
+        completed = int(df.loc[df["status"] == "COMPLETED", "cnt"].sum()) if not df.empty else 0
+        data["total_assignments"] = int(total_assignments)
+        data["completed_assignments"] = completed
+        data["pending_assignments"] = int(total_assignments - completed)
+
+        data["evaluators"] = int(
+            pd.read_sql(
+                "SELECT COUNT(DISTINCT id) AS cnt FROM evaluators WHERE project_id = ?",
+                conn,
+                params=(project_id,),
+            )["cnt"].iloc[0]
+        )
+        data["leaders"] = int(
+            pd.read_sql(
+                "SELECT COUNT(DISTINCT id) AS cnt FROM leaders WHERE project_id = ?",
+                conn,
+                params=(project_id,),
+            )["cnt"].iloc[0]
+        )
+        data["responses"] = int(
+            pd.read_sql(
+                "SELECT COUNT(*) AS cnt FROM responses WHERE assignment_id IN (SELECT id FROM assignments WHERE project_id = ?)",
+                conn,
+                params=(project_id,),
+            )["cnt"].iloc[0]
+        )
+    finally:
+        conn.close()
+    return data
+
+
+def get_assignments_with_people(project_id):
+    """평가자-피평가자 매핑 상세"""
+    conn = get_connection()
+    query = """
+        SELECT A.id, E.name AS evaluator, E.email, L.name AS leader, L.department, L.position,
+               A.relation, A.project_group, A.status, A.completed_at
+        FROM assignments A
+        JOIN evaluators E ON A.evaluator_id = E.id
+        JOIN leaders L ON A.leader_id = L.id
+        WHERE A.project_id = ?
+        ORDER BY A.id DESC
+    """
+    df = pd.read_sql(query, conn, params=(project_id,))
+    conn.close()
+    return df
+
+
+def get_responses_with_people(project_id):
+    """응답 데이터 조회 (문항 포함)"""
+    conn = get_connection()
+    query = """
+        SELECT R.id, R.assignment_id, SQ.title AS question, SQ.question_type, R.response_value, R.submitted_at,
+               E.name AS evaluator, L.name AS leader
+        FROM responses R
+        JOIN assignments A ON R.assignment_id = A.id
+        JOIN evaluators E ON A.evaluator_id = E.id
+        JOIN leaders L ON A.leader_id = L.id
+        JOIN survey_questions SQ ON R.question_id = SQ.id
+        WHERE A.project_id = ?
+        ORDER BY R.submitted_at DESC, R.id DESC
+    """
+    df = pd.read_sql(query, conn, params=(project_id,))
+    conn.close()
+    return df
 
 def reset_database():
     """모든 테이블을 삭제하고 다시 초기화 (강제 리셋)"""
@@ -245,3 +451,53 @@ def reset_database():
     # 다시 테이블 생성
     init_db()
     return "DB가 깨끗하게 초기화되었습니다. 이제 샘플 데이터를 생성하세요."
+
+
+def get_evaluator_tokens(project_id):
+    """프로젝트별 평가자 토큰 목록"""
+    conn = get_connection()
+    df = pd.read_sql(
+        """
+        SELECT id, name, email, evaluator_code, access_token, is_active
+        FROM evaluators
+        WHERE project_id = ?
+        ORDER BY name
+        """,
+        conn,
+        params=(project_id,),
+    )
+    conn.close()
+    return df
+
+
+def add_question(project_id, title, question_type, scale_min=1, scale_max=5, sort_order=None):
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        if sort_order is None:
+            c.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM survey_questions WHERE project_id = ?",
+                (project_id,),
+            )
+            sort_order = c.fetchone()[0] or 1
+        c.execute(
+            """
+            INSERT INTO survey_questions (project_id, title, question_type, scale_min, scale_max, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, title, question_type, scale_min, scale_max, sort_order),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def delete_question(question_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM survey_questions WHERE id = ?", (question_id,))
+    conn.commit()
+    conn.close()
+    return True
+
