@@ -228,3 +228,20 @@ def save_response(assignment_id, q1, q2, comment):
     conn.commit()
     conn.close()
     return True
+
+# database.py 맨 아래에 추가하세요
+
+def reset_database():
+    """모든 테이블을 삭제하고 다시 초기화 (강제 리셋)"""
+    conn = get_connection()
+    c = conn.cursor()
+    # 순서 중요: 참조 무결성 때문에 자식 테이블부터 삭제
+    tables = ["responses", "assignments", "evaluators", "leaders", "projects", "corporates"]
+    for table in tables:
+        c.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.commit()
+    conn.close()
+    
+    # 다시 테이블 생성
+    init_db()
+    return "DB가 깨끗하게 초기화되었습니다. 이제 샘플 데이터를 생성하세요."
