@@ -1,0 +1,11 @@
+[
+  {
+    "client": "ACME",
+    "course": "리더십 코칭",
+    "manager": "홍길동",
+    "date": "2024-10-01",
+    "category": "리더십",
+    "survey_name": "ACME 리더십 만족도",
+    "sheet_url": "https://docs.google.com/spreadsheets/d/EXAMPLE_ID/edit#gid=0"
+  }
+]

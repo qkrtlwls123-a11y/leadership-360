@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>설문 데이터 동기화</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 2rem;
+        max-width: 720px;
+      }
+      form {
+        margin-bottom: 1.5rem;
+      }
+      .card {
+        border: 1px solid #ddd;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 1.5rem;
+      }
+      .field {
+        margin-bottom: 0.75rem;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+      }
+      input {
+        width: 100%;
+        padding: 0.5rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      button {
+        padding: 0.6rem 1.2rem;
+        background: #2f6fed;
+        border: none;
+        color: #fff;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #4b5563;
+      }
+      pre {
+        background: #f7f7f7;
+        padding: 1rem;
+        border-radius: 6px;
+        overflow-x: auto;
+      }
+      .message {
+        padding: 0.75rem 1rem;
+        background: #eef3ff;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>설문 데이터 동기화</h1>
+
+    {% if message %}
+      <div class="message">{{ message }}</div>
+    {% endif %}
+
+    <div class="card">
+      <form method="post">
+        <input type="hidden" name="action" value="sync" />
+        <button type="submit">동기화 실행</button>
+      </form>
+      {% if sync_result %}
+        <pre>{{ sync_result | tojson(indent=2, ensure_ascii=false) }}</pre>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>설문 등록</h2>
+      <form method="post">
+        <input type="hidden" name="action" value="register" />
+        <div class="field">
+          <label for="client">고객사</label>
+          <input id="client" name="client" required />
+        </div>
+        <div class="field">
+          <label for="course">과정명</label>
+          <input id="course" name="course" required />
+        </div>
+        <div class="field">
+          <label for="manager">담당자</label>
+          <input id="manager" name="manager" required />
+        </div>
+        <div class="field">
+          <label for="date">날짜 (YYYY-MM-DD)</label>
+          <input id="date" name="date" required />
+        </div>
+        <div class="field">
+          <label for="category">설문 구분</label>
+          <input id="category" name="category" required />
+        </div>
+        <div class="field">
+          <label for="survey_name">설문명</label>
+          <input id="survey_name" name="survey_name" required />
+        </div>
+        <div class="field">
+          <label for="sheet_url">Google Sheet URL</label>
+          <input id="sheet_url" name="sheet_url" required />
+        </div>
+        <button type="submit" class="secondary">등록</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>등록된 설문</h2>
+      {% if entries %}
+        <pre>{{ entries | tojson(indent=2, ensure_ascii=false) }}</pre>
+      {% else %}
+        <p>등록된 설문이 없습니다.</p>
+      {% endif %}
+    </div>
+  </body>
+</html>
