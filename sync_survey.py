@@ -1,194 +1,155 @@
-import json
-import os
-from datetime import datetime
-from typing import Any, Dict, List, Tuple
-
 import gspread
 import pymysql
+import json
+import re
+import os
+from datetime import datetime
 
-CONFIG_PATH = os.getenv("FORMS_CONFIG_PATH", "forms_config.json")
-SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT", "service_account.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SERVICE_ACCOUNT_FILE = os.path.join(BASE_DIR, 'service_account.json')
+FORMS_CONFIG_FILE = os.path.join(BASE_DIR, 'forms_config.json')
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "127.0.0.1"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "nas_user"),
-    "password": os.getenv("DB_PASSWORD", "nas_password"),
-    "database": os.getenv("DB_NAME", "nas_surveys"),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", "Zmfflr19!@"),
+    "database": os.getenv("DB_NAME", "test"),
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.DictCursor,
-    "autocommit": False,
 }
 
-
+# --- [2] 웹 서버 연동용 클래스 및 함수 (이게 없어서 오류가 났던 것) ---
 class SyncError(Exception):
+    """동기화 중 발생하는 사용자 정의 에러"""
     pass
 
-
-def load_config(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
+def load_config():
+    """설정 파일 읽기"""
+    if not os.path.exists(FORMS_CONFIG_FILE):
         return []
-    with open(path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, list):
-        raise SyncError("forms_config.json must contain a list of survey configs")
-    return data
+    with open(FORMS_CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
+def add_survey_config(new_config):
+    """새로운 설문 설정을 JSON에 추가"""
+    configs = load_config()
+    configs.append(new_config)
+    with open(FORMS_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(configs, f, ensure_ascii=False, indent=4)
 
-def save_config(path: str, data: List[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+# --- [3] 핵심 로직 ---
+def get_db_connection():
+    return pymysql.connect(**DB_CONFIG)
 
+def get_or_create_question_id(cursor, question_text):
+    sql = "SELECT id FROM question_bank WHERE question_text = %s"
+    cursor.execute(sql, (question_text,))
+    result = cursor.fetchone()
+    if result:
+        return result['id']
+    else:
+        sql = "INSERT INTO question_bank (category, type, question_text, keyword) VALUES ('미분류', '자동생성', %s, 'auto')"
+        cursor.execute(sql, (question_text,))
+        return cursor.lastrowid
 
-def open_sheet(client: gspread.Client, sheet_url: str):
-    return client.open_by_url(sheet_url)
+def sync_sheet(survey_info, gc, conn):
+    # 구글 시트 연결
+    try:
+        sh = gc.open_by_url(survey_info['sheet_url'])
+        worksheet = sh.sheet1
+    except Exception as e:
+        return f"실패: 시트 접근 불가 ({str(e)})"
 
-
-def ensure_synced_column(worksheet: gspread.Worksheet, headers: List[str]) -> Tuple[List[str], int]:
-    if headers and headers[-1].strip().lower() == "synced":
-        return headers, len(headers)
-    new_headers = headers + ["Synced"]
-    worksheet.resize(rows=worksheet.row_count, cols=len(new_headers))
-    worksheet.update("1:1", [new_headers])
-    return new_headers, len(new_headers)
-
-
-def get_or_create_survey(cursor, survey: Dict[str, Any]) -> int:
-    query = (
-        "SELECT id FROM survey_info WHERE client_name=%s AND course_name=%s AND manager=%s "
-        "AND date=%s AND category=%s AND survey_name=%s"
-    )
-    values = (
-        survey["client"],
-        survey["course"],
-        survey["manager"],
-        survey["date"],
-        survey["category"],
-        survey["survey_name"],
-    )
-    cursor.execute(query, values)
-    existing = cursor.fetchone()
-    if existing:
-        return int(existing["id"])
-
-    insert_query = (
-        "INSERT INTO survey_info (client_name, course_name, manager, date, category, survey_name) "
-        "VALUES (%s, %s, %s, %s, %s, %s)"
-    )
-    cursor.execute(insert_query, values)
-    return int(cursor.lastrowid)
-
-
-def get_or_create_question(cursor, category: str, question_text: str) -> int:
-    select_query = "SELECT id FROM question_bank WHERE question_text=%s"
-    cursor.execute(select_query, (question_text,))
-    existing = cursor.fetchone()
-    if existing:
-        return int(existing["id"])
-
-    insert_query = (
-        "INSERT INTO question_bank (category, type, question_text) VALUES (%s, %s, %s)"
-    )
-    cursor.execute(insert_query, (category, "자동생성", question_text))
-    return int(cursor.lastrowid)
-
-
-def response_exists(cursor, survey_id: int, respondent_id: str) -> bool:
-    cursor.execute(
-        "SELECT 1 FROM responses WHERE survey_id=%s AND respondent_id=%s LIMIT 1",
-        (survey_id, respondent_id),
-    )
-    return cursor.fetchone() is not None
-
-
-def insert_response(cursor, survey_id: int, respondent_id: str, question_id: int, answer_value: str) -> None:
-    cursor.execute(
-        "INSERT IGNORE INTO responses (survey_id, respondent_id, question_id, answer_value) "
-        "VALUES (%s, %s, %s, %s)",
-        (survey_id, respondent_id, question_id, answer_value),
-    )
-
-
-def sync_sheet(survey: Dict[str, Any], client: gspread.Client, connection) -> Dict[str, Any]:
-    spreadsheet = open_sheet(client, survey["sheet_url"])
-    worksheet = spreadsheet.sheet1
     all_values = worksheet.get_all_values()
-    if not all_values:
-        return {"survey_name": survey["survey_name"], "synced_rows": 0}
+    if not all_values: return "데이터 없음"
 
     headers = all_values[0]
-    headers, synced_col = ensure_synced_column(worksheet, headers)
-    question_headers = headers[:-1]
+    data_rows = all_values[1:]
 
-    synced_rows = 0
-    with connection.cursor() as cursor:
-        survey_id = get_or_create_survey(cursor, survey)
-        question_map = {
-            question: get_or_create_question(cursor, survey["category"], question)
-            for question in question_headers
-        }
+    # 헤더에 SyncStatus 없으면 추가
+    if 'SyncStatus' not in headers:
+        headers.append('SyncStatus')
+        worksheet.update(values=[headers], range_name="1:1")
+        sync_col_idx = len(headers)
+    else:
+        sync_col_idx = headers.index('SyncStatus') + 1
 
-        for index, row in enumerate(all_values[1:], start=2):
-            row = row + [""] * (len(headers) - len(row))
-            synced_flag = row[synced_col - 1].strip().lower()
-            respondent_id = f"{survey_id}_{index}"
-            if synced_flag in {"y", "yes", "true", "1", "synced"}:
+    new_count = 0
+    cells_to_update = [] 
+
+    with conn.cursor() as cursor:
+        # 설문 정보 등록
+        sql_survey = """
+            INSERT INTO survey_info (client_name, course_name, manager, date, category, survey_name)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)
+        """
+        cursor.execute(sql_survey, (
+            survey_info['client'], survey_info['course'], survey_info['manager'], 
+            survey_info['date'], survey_info['category'], survey_info['survey_name']
+        ))
+        survey_id = cursor.lastrowid
+
+        # 질문 매핑
+        question_map = {}
+        for idx, text in enumerate(headers):
+            if text in ['타임스탬프', 'timestamp', 'SyncStatus'] or not text.strip(): continue
+            question_map[idx] = get_or_create_question_id(cursor, text)
+
+        # 데이터 저장
+        for row_idx, row in enumerate(data_rows):
+            excel_row_num = row_idx + 2
+            # 이미 처리된 행인지 확인
+            if len(row) >= sync_col_idx and row[sync_col_idx - 1] == 'Y':
                 continue
-            if response_exists(cursor, survey_id, respondent_id):
-                worksheet.update_cell(index, synced_col, "Y")
-                continue
-            for question, answer in zip(question_headers, row[: len(question_headers)]):
-                question_id = question_map[question]
-                insert_response(cursor, survey_id, respondent_id, question_id, answer)
-            worksheet.update_cell(index, synced_col, "Y")
-            synced_rows += 1
 
-    return {"survey_name": survey["survey_name"], "synced_rows": synced_rows}
+            respondent_id = f"S{survey_id}_R{excel_row_num}"
+            
+            for col_idx, answer in enumerate(row):
+                if col_idx in question_map and col_idx != (sync_col_idx - 1):
+                    q_id = question_map[col_idx]
+                    sql_resp = "INSERT INTO responses (survey_id, respondent_id, question_id, answer_value) VALUES (%s, %s, %s, %s)"
+                    cursor.execute(sql_resp, (survey_id, respondent_id, q_id, answer))
+            
+            # 업데이트할 셀 목록에 추가 (메모리)
+            cells_to_update.append(gspread.Cell(excel_row_num, sync_col_idx, 'Y'))
+            new_count += 1
 
+        conn.commit()
 
-def run_sync() -> Dict[str, Any]:
-    config = load_config(CONFIG_PATH)
-    if not config:
-        return {"synced": [], "message": "No surveys configured."}
-
-    client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-    results = []
-    with pymysql.connect(**DB_CONFIG) as connection:
+    # 구글 시트에 한 번에 반영 (Batch Update)
+    if cells_to_update:
         try:
-            for survey in config:
-                results.append(sync_sheet(survey, client, connection))
-            connection.commit()
-        except Exception as exc:
-            connection.rollback()
-            raise SyncError(str(exc)) from exc
+            worksheet.update_cells(cells_to_update)
+        except Exception as e:
+            print(f"경고: 시트 업데이트 실패 ({e})")
 
-    return {"synced": results, "message": "Sync completed"}
+    return f"성공 ({new_count}건)"
 
+def run_sync():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE): raise SyncError("service_account.json 없음")
+    if not os.path.exists(FORMS_CONFIG_FILE): return "설정 파일 없음 (설문이 등록되지 않음)"
 
-def add_survey_config(new_entry: Dict[str, Any]) -> bool:
-    required = {"client", "course", "manager", "date", "category", "survey_name", "sheet_url"}
-    missing = required - set(new_entry.keys())
-    if missing:
-        raise SyncError(f"Missing required fields: {', '.join(sorted(missing))}")
+    configs = load_config()
+    if not configs: return "등록된 설문이 없습니다."
 
     try:
-        datetime.strptime(new_entry["date"], "%Y-%m-%d")
-    except ValueError as exc:
-        raise SyncError("date must be in YYYY-MM-DD format") from exc
+        client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+    except Exception as e:
+        raise SyncError(f"구글 인증 실패: {e}")
 
-    config = load_config(CONFIG_PATH)
-    updated = False
-    for index, existing in enumerate(config):
-        if existing.get("sheet_url") == new_entry["sheet_url"]:
-            config[index] = new_entry
-            updated = True
-            break
-    if not updated:
-        config.append(new_entry)
-    save_config(CONFIG_PATH, config)
-    return updated
+    results = []
+    try:
+        conn = get_db_connection()
+        for survey in configs:
+            res = sync_sheet(survey, client, conn)
+            results.append(f"[{survey['survey_name']}] {res}")
+        conn.close()
+    except Exception as e:
+        raise SyncError(f"DB 오류: {e}")
 
+    return "\n".join(results)
 
 if __name__ == "__main__":
-    summary = run_sync()
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(run_sync())
