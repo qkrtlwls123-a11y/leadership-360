@@ -165,7 +165,7 @@ def run_sync() -> Dict[str, Any]:
     return {"synced": results, "message": "Sync completed"}
 
 
-def add_survey_config(new_entry: Dict[str, Any]) -> None:
+def add_survey_config(new_entry: Dict[str, Any]) -> bool:
     required = {"client", "course", "manager", "date", "category", "survey_name", "sheet_url"}
     missing = required - set(new_entry.keys())
     if missing:
@@ -177,8 +177,16 @@ def add_survey_config(new_entry: Dict[str, Any]) -> None:
         raise SyncError("date must be in YYYY-MM-DD format") from exc
 
     config = load_config(CONFIG_PATH)
-    config.append(new_entry)
+    updated = False
+    for index, existing in enumerate(config):
+        if existing.get("sheet_url") == new_entry["sheet_url"]:
+            config[index] = new_entry
+            updated = True
+            break
+    if not updated:
+        config.append(new_entry)
     save_config(CONFIG_PATH, config)
+    return updated
 
 
 if __name__ == "__main__":
