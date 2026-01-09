@@ -1,7 +1,6 @@
-import json
 from flask import Flask, redirect, render_template, request, url_for
 
-from sync_survey import SyncError, add_survey_config, run_sync
+from sync_survey import SyncError, add_survey_config, load_config, run_sync
 
 app = Flask(__name__)
 
@@ -39,8 +38,8 @@ def register():
             "sheet_url": request.form.get("sheet_url", "").strip(),
         }
         try:
-            add_survey_config(entry)
-            success = "설문 정보가 등록되었습니다."
+            updated = add_survey_config(entry)
+            success = "설문 정보가 업데이트되었습니다." if updated else "설문 정보가 등록되었습니다."
         except SyncError as exc:
             error = str(exc)
 
@@ -49,8 +48,7 @@ def register():
 
 @app.route("/config")
 def config_view():
-    with open("forms_config.json", "r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    data = load_config("forms_config.json")
     return render_template("config.html", data=data)
 
 
